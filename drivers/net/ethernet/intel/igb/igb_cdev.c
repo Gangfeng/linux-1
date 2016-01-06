@@ -92,7 +92,7 @@ static int igb_bind(struct file *file, void __user *argp)
 
 	adapter = (struct igb_adapter *)file->private_data;
 
-	if (NULL == adapter)
+	if (adapter == NULL)
 		return -ENOENT;
 
 	mmap_size = pci_resource_len(adapter->pdev, 0);
@@ -119,7 +119,7 @@ static long igb_mapring(struct file *file, void __user *arg)
 		return -EINVAL;
 
 	adapter = file->private_data;
-	if (NULL == adapter) {
+	if (adapter == NULL) {
 		dev_err(&adapter->pdev->dev, "map to unbound device!\n");
 		return -ENOENT;
 	}
@@ -181,7 +181,7 @@ static long igb_mapbuf(struct file *file, void __user *arg)
 		return -EINVAL;
 
 	adapter = file->private_data;
-	if (NULL == adapter) {
+	if (adapter == NULL) {
 		dev_err(&adapter->pdev->dev, "map to unbound device!\n");
 		return -ENOENT;
 	}
@@ -244,7 +244,7 @@ static long igb_unmapring(struct file *file, void __user *arg)
 		return -EINVAL;
 
 	adapter = file->private_data;
-	if (NULL == adapter) {
+	if (adapter == NULL) {
 		dev_err(&adapter->pdev->dev, "map to unbound device!\n");
 		return -ENOENT;
 	}
@@ -306,7 +306,7 @@ static long igb_unmapbuf(struct file *file, void __user *arg)
 		return -EFAULT;
 
 	adapter = file->private_data;
-	if (NULL == adapter) {
+	if (adapter == NULL) {
 		dev_err(&adapter->pdev->dev, "map to unbound device!\n");
 		return -ENOENT;
 	}
@@ -394,7 +394,7 @@ static int igb_close_file(struct inode *inode, struct file *file)
 {
 	struct igb_adapter *adapter = file->private_data;
 
-	if (NULL == adapter)
+	if (adapter == NULL)
 		return 0;
 
 	mutex_lock(&adapter->cdev_mutex);
@@ -430,7 +430,7 @@ static int igb_mmap(struct file *file, struct vm_area_struct *vma)
 	dma_addr_t pgoff = vma->vm_pgoff;
 	dma_addr_t physaddr;
 
-	if (NULL == adapter)
+	if (adapter == NULL)
 		return -ENODEV;
 
 	if (pgoff == 0)
