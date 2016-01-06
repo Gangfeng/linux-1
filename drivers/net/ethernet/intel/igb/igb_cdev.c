@@ -407,8 +407,7 @@ static int igb_close_file(struct inode *inode, struct file *file)
 
 		list_for_each_entry_safe(userpage, tmp,
 					 &adapter->user_page_list, page_node) {
-			if (userpage)
-				igb_free_page(adapter, userpage);
+			igb_free_page(adapter, userpage);
 		}
 	}
 	mutex_unlock(&adapter->user_page_mutex);
