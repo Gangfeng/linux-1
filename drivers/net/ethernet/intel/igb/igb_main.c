@@ -56,6 +56,7 @@
 #endif
 #include <linux/i2c.h>
 #include "igb.h"
+#include "igb_cdev.h"
 
 #define MAJ 5
 #define MIN 4
@@ -693,6 +694,11 @@ static int __init igb_init_module(void)
 #ifdef CONFIG_IGB_DCA
 	dca_register_notify(&dca_notifier);
 #endif
+
+	ret = igb_cdev_init(igb_driver_name);
+	if (ret)
+		return ret;
+
 	ret = pci_register_driver(&igb_driver);
 	return ret;
 }
@@ -711,6 +717,8 @@ static void __exit igb_exit_module(void)
 	dca_unregister_notify(&dca_notifier);
 #endif
 	pci_unregister_driver(&igb_driver);
+
+	igb_cdev_destroy();
 }
 
 module_exit(igb_exit_module);
@@ -1639,7 +1647,8 @@ static void igb_configure(struct igb_adapter *adapter)
 	 * at least 1 descriptor unused to make sure
 	 * next_to_use != next_to_clean
 	 */
-	for (i = 0; i < adapter->num_rx_queues; i++) {
+	i = adapter->qav_mode ? IGB_USER_RX_QUEUES : 0;
+	for (; i < adapter->num_rx_queues; i++) {
 		struct igb_ring *ring = adapter->rx_ring[i];
 		igb_alloc_rx_buffers(ring, igb_desc_unused(ring));
 	}
@@ -2158,10 +2167,24 @@ igb_features_check(struct sk_buff *skb, struct net_device *dev,
 	return features;
 }
 
+static u16 igb_select_queue(struct net_device *netdev,
+			    struct sk_buff *skb,
+			    void *accel_priv,
+			    select_queue_fallback_t fallback)
+{
+	struct igb_adapter *adapter = netdev_priv(netdev);
+
+	if (adapter->qav_mode)
+		return adapter->num_tx_queues - 1;
+	else
+		return fallback(netdev, skb);
+}
+
 static const struct net_device_ops igb_netdev_ops = {
 	.ndo_open		= igb_open,
 	.ndo_stop		= igb_close,
 	.ndo_start_xmit		= igb_xmit_frame,
+	.ndo_select_queue	= igb_select_queue,
 	.ndo_get_stats64	= igb_get_stats64,
 	.ndo_set_rx_mode	= igb_set_rx_mode,
 	.ndo_set_mac_address	= igb_set_mac,
@@ -2385,6 +2408,10 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	hw->back = adapter;
 	adapter->msg_enable = netif_msg_init(debug, DEFAULT_MSG_ENABLE);
 	adapter->qav_mode = false;
+
+	adapter->tx_uring_init = 0;
+	adapter->rx_uring_init = 0;
+	adapter->cdev_in_use = false;
 
 	err = -EIO;
 	adapter->io_addr = pci_iomap(pdev, 0, 0);
@@ -2675,6 +2702,10 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		}
 	}
 
+	err = igb_add_cdev(adapter);
+	if (err)
+		goto err_register;
+
 	/* carrier off reporting is important to ethtool even BEFORE open */
 	netif_carrier_off(netdev);
 
@@ -2922,6 +2953,8 @@ static void igb_remove(struct pci_dev *pdev)
 	struct igb_adapter *adapter = netdev_priv(netdev);
 	struct e1000_hw *hw = &adapter->hw;
 
+	igb_remove_cdev(adapter);
+
 	pm_runtime_get_noresume(&pdev->dev);
 #ifdef CONFIG_IGB_HWMON
 	igb_sysfs_exit(adapter);
@@ -3113,6 +3146,12 @@ static int igb_sw_init(struct igb_adapter *adapter)
 
 	spin_lock_init(&adapter->nfc_lock);
 	spin_lock_init(&adapter->stats64_lock);
+
+	INIT_LIST_HEAD(&adapter->user_page_list);
+	mutex_init(&adapter->user_page_mutex);
+	mutex_init(&adapter->user_ring_mutex);
+	mutex_init(&adapter->cdev_mutex);
+
 #ifdef CONFIG_PCI_IOV
 	switch (hw->mac.type) {
 	case e1000_82576:
@@ -3366,7 +3405,8 @@ static int igb_setup_all_tx_resources(struct igb_adapter *adapter)
 	struct pci_dev *pdev = adapter->pdev;
 	int i, err = 0;
 
-	for (i = 0; i < adapter->num_tx_queues; i++) {
+	i = adapter->qav_mode ? IGB_USER_TX_QUEUES : 0;
+	for (; i < adapter->num_tx_queues; i++) {
 		err = igb_setup_tx_resources(adapter->tx_ring[i]);
 		if (err) {
 			dev_err(&pdev->dev,
@@ -3454,7 +3494,8 @@ static void igb_configure_tx(struct igb_adapter *adapter)
 {
 	int i;
 
-	for (i = 0; i < adapter->num_tx_queues; i++)
+	i = adapter->qav_mode ? IGB_USER_TX_QUEUES : 0;
+	for (; i < adapter->num_tx_queues; i++)
 		igb_configure_tx_ring(adapter, adapter->tx_ring[i]);
 }
 
@@ -3509,7 +3550,8 @@ static int igb_setup_all_rx_resources(struct igb_adapter *adapter)
 	struct pci_dev *pdev = adapter->pdev;
 	int i, err = 0;
 
-	for (i = 0; i < adapter->num_rx_queues; i++) {
+	i = adapter->qav_mode ? IGB_USER_RX_QUEUES : 0;
+	for (; i < adapter->num_rx_queues; i++) {
 		err = igb_setup_rx_resources(adapter->rx_ring[i]);
 		if (err) {
 			dev_err(&pdev->dev,
@@ -3533,6 +3575,15 @@ static void igb_setup_mrqc(struct igb_adapter *adapter)
 	u32 mrqc, rxcsum;
 	u32 j, num_rx_queues;
 	u32 rss_key[10];
+
+	/* For TSN, kernel driver only create buffer for queue 2 and queue 3,
+	 * by default receive all BE packets from queue 3.
+	 */
+	if (adapter->qav_mode) {
+		wr32(E1000_MRQC, (adapter->num_rx_queues - 1)
+		     << E1000_MRQC_DEF_QUEUE_OFFSET);
+		return;
+	}
 
 	netdev_rss_key_fill(rss_key, sizeof(rss_key));
 	for (j = 0; j < 10; j++)
@@ -3816,7 +3867,8 @@ static void igb_configure_rx(struct igb_adapter *adapter)
 	/* Setup the HW Rx Head and Tail Descriptor Pointers and
 	 * the Base and Length of the Rx Descriptor Ring
 	 */
-	for (i = 0; i < adapter->num_rx_queues; i++)
+	i = adapter->qav_mode ? IGB_USER_RX_QUEUES : 0;
+	for (; i < adapter->num_rx_queues; i++)
 		igb_configure_rx_ring(adapter, adapter->rx_ring[i]);
 }
 
@@ -3852,8 +3904,8 @@ void igb_free_tx_resources(struct igb_ring *tx_ring)
 static void igb_free_all_tx_resources(struct igb_adapter *adapter)
 {
 	int i;
-
-	for (i = 0; i < adapter->num_tx_queues; i++)
+	i = adapter->qav_mode ? IGB_USER_TX_QUEUES : 0;
+	for (; i < adapter->num_tx_queues; i++)
 		if (adapter->tx_ring[i])
 			igb_free_tx_resources(adapter->tx_ring[i]);
 }
@@ -3919,7 +3971,8 @@ static void igb_clean_all_tx_rings(struct igb_adapter *adapter)
 {
 	int i;
 
-	for (i = 0; i < adapter->num_tx_queues; i++)
+	i = adapter->qav_mode ? IGB_USER_TX_QUEUES : 0;
+	for (; i < adapter->num_tx_queues; i++)
 		if (adapter->tx_ring[i])
 			igb_clean_tx_ring(adapter->tx_ring[i]);
 }
@@ -3957,7 +4010,8 @@ static void igb_free_all_rx_resources(struct igb_adapter *adapter)
 {
 	int i;
 
-	for (i = 0; i < adapter->num_rx_queues; i++)
+	i = adapter->qav_mode ? IGB_USER_RX_QUEUES : 0;
+	for (; i < adapter->num_rx_queues; i++)
 		if (adapter->rx_ring[i])
 			igb_free_rx_resources(adapter->rx_ring[i]);
 }
@@ -4025,7 +4079,8 @@ static void igb_clean_all_rx_rings(struct igb_adapter *adapter)
 {
 	int i;
 
-	for (i = 0; i < adapter->num_rx_queues; i++)
+	i = adapter->qav_mode ? IGB_USER_TX_QUEUES : 0;
+	for (; i < adapter->num_rx_queues; i++)
 		if (adapter->rx_ring[i])
 			igb_clean_rx_ring(adapter->rx_ring[i]);
 }
@@ -7200,6 +7255,11 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 	struct sk_buff *skb = rx_ring->skb;
 	unsigned int total_bytes = 0, total_packets = 0;
 	u16 cleaned_count = igb_desc_unused(rx_ring);
+	struct igb_adapter *adapter = netdev_priv(rx_ring->netdev);
+
+	/* Don't service user (AVB) queues */
+	if (adapter->qav_mode && rx_ring->queue_index < IGB_USER_RX_QUEUES)
+		return true;
 
 	while (likely(total_packets < budget)) {
 		union e1000_adv_rx_desc *rx_desc;
@@ -8493,6 +8553,9 @@ static int igb_change_mode(struct igb_adapter *adapter, int request_mode)
 	if (request_mode == current_mode)
 		return 0;
 
+	if (adapter->cdev_in_use)
+		return -EBUSY;
+
 	netdev = adapter->netdev;
 
 	rtnl_lock();
@@ -8501,6 +8564,11 @@ static int igb_change_mode(struct igb_adapter *adapter, int request_mode)
 		igb_close(netdev);
 	else
 		igb_reset(adapter);
+
+	if (current_mode) {
+		igb_tsn_free_all_rx_resources(adapter);
+		igb_tsn_free_all_tx_resources(adapter);
+	}
 
 	igb_clear_interrupt_scheme(adapter);
 
@@ -8515,12 +8583,23 @@ static int igb_change_mode(struct igb_adapter *adapter, int request_mode)
 		goto err_out;
 	}
 
+	if (request_mode) {
+		err = igb_tsn_setup_all_tx_resources(adapter);
+		if (err)
+			goto err_out;
+		err = igb_tsn_setup_all_rx_resources(adapter);
+		if (err)
+			goto err_tsn_setup_rx;
+	}
+
 	if (netif_running(netdev))
 		igb_open(netdev);
 
 	rtnl_unlock();
 
 	return err;
+err_tsn_setup_rx:
+	igb_tsn_free_all_tx_resources(adapter);
 err_out:
 	rtnl_unlock();
 	return err;
