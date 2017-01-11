@@ -2902,7 +2902,7 @@ static int igb_add_ethtool_nfc_entry(struct igb_adapter *adapter,
 		if (!memcmp(&input->filter, &rule->filter,
 			    sizeof(input->filter))) {
 			err = -EEXIST;
-			dev_err(&adapter->pdev->dev,
+			dev_info(&adapter->pdev->dev,
 				"ethtool: this filter is already set\n");
 			goto err_out_w_lock;
 		}
